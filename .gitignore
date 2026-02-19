@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+tests/output/
+test_workspace/
+
+# GDB
+.gdb_history
+peda-session-*.txt
+core
+core.*
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+/tmp/
+
+# Build artifacts (if testing with Zephyr)
+build/
+build-*/
+zephyr.elf
+zephyr.bin
+zephyr.hex
+.west/
+
+# Documentation build
+docs/_build/
+site/

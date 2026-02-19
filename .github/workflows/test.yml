@@ -1,0 +1,138 @@
+name: Test Zephyr GDB Extension
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          git cmake ninja-build gperf ccache dfu-util \
+          device-tree-compiler wget xz-utils file make gcc \
+          gcc-multilib g++-multilib libsdl2-dev libmagic1 \
+          python3-pip python3-setuptools python3-tk python3-wheel \
+          python3-dev libpython3.10
+
+    - name: Install West
+      run: pip install west
+
+    - name: Install Zephyr SDK
+      run: |
+        cd ~
+        wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+        tar xf zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+        cd zephyr-sdk-0.16.8
+        ./setup.sh -t x86_64-zephyr-elf -h -c
+        echo "ZEPHYR_SDK_INSTALL_DIR=$HOME/zephyr-sdk-0.16.8" >> $GITHUB_ENV
+
+    - name: Build Zephyr sample
+      run: python3 tests/test_local.py --zephyr-version v4.2.1 --build-only
+      timeout-minutes: 30
+
+    - name: Upload ELF artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: zephyr-elf
+        path: tests/output/zephyr.elf
+
+  debug-auto:
+    name: Debug (auto)
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install runtime dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends qemu-system-x86 gdb
+    - name: Download ELF artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: zephyr-elf
+        path: tests/output/
+    - name: Run test (auto)
+      run: python3 tests/test_qemu.py --elf tests/output/zephyr.elf --discovery-mode auto
+      timeout-minutes: 10
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: results-auto
+        path: tests/output/
+
+  debug-symbols:
+    name: Debug (symbols)
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install runtime dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends qemu-system-x86 gdb
+    - name: Download ELF artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: zephyr-elf
+        path: tests/output/
+    - name: Run test (symbols)
+      run: python3 tests/test_qemu.py --elf tests/output/zephyr.elf --discovery-mode symbols
+      timeout-minutes: 10
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: results-symbols
+        path: tests/output/
+
+  debug-hardcoded:
+    name: Debug (hardcoded)
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install runtime dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends qemu-system-x86 gdb
+    - name: Download ELF artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: zephyr-elf
+        path: tests/output/
+    - name: Run test (hardcoded)
+      run: python3 tests/test_qemu.py --elf tests/output/zephyr.elf --discovery-mode hardcoded
+      timeout-minutes: 10
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: results-hardcoded
+        path: tests/output/
