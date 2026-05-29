@@ -1329,6 +1329,39 @@ if hasattr(gdb, 'MICommand'):
                 "frame": _build_frame_dict(target_thread),
             }
 
+    class MIOverrideRestoreThreadContext(gdb.MICommand):
+        """MI command: -override-restore-thread-context
+
+        Restores the CPU registers ($sp, $pc, $lr) to the hardware-active
+        thread's real values, undoing any context switch performed by a
+        previous -override-thread-select for a suspended thread.
+
+        MUST be called after every command sequence that used
+        -override-thread-select for a suspended (non-active) thread, to
+        ensure the CPU registers are correct before execution resumes.
+
+        This is a no-op when no context switch is pending (_real_cpu_regs
+        is None), so it is always safe to call.
+        """
+
+        def __init__(self):
+            super().__init__('-override-restore-thread-context')
+
+        def invoke(self, argv):
+            global _real_cpu_regs
+            if _real_cpu_regs is not None:
+                try:
+                    gdb.execute(f'set $sp = 0x{_real_cpu_regs["sp"]:x}', to_string=True)
+                    gdb.execute(f'set $pc = 0x{_real_cpu_regs["pc"]:x}', to_string=True)
+                    lr = _real_cpu_regs.get("lr")
+                    if lr:
+                        gdb.execute(f'set $lr = 0x{lr:x}', to_string=True)
+                except Exception:
+                    pass
+                _real_cpu_regs = None
+                gdb.invalidate_cached_frames()
+            return {}
+
     class MIOverrideStackListFrames(gdb.MICommand):
         """MI command: -override-stack-list-frames --override-thread <id> [<low> <high>]
 
@@ -1399,10 +1432,11 @@ if hasattr(gdb, 'MICommand'):
     # at script load time (see below).
     # -------------------------------------------------------------------
     MI_COMMAND_REGISTRY = [
-        (MIOverrideThreadInfo,      'thread-info       -> override-thread-info'),
-        (MIOverrideThreadListIds,   'thread-list-ids   -> override-thread-list-ids'),
-        (MIOverrideThreadSelect,    'thread-select     -> override-thread-select'),
-        (MIOverrideStackListFrames, 'stack-list-frames -> override-stack-list-frames'),
+        (MIOverrideThreadInfo,             'thread-info       -> override-thread-info'),
+        (MIOverrideThreadListIds,          'thread-list-ids   -> override-thread-list-ids'),
+        (MIOverrideThreadSelect,           'thread-select     -> override-thread-select'),
+        (MIOverrideRestoreThreadContext,   'restore-thread-context (post-preSelectThread restore)'),
+        (MIOverrideStackListFrames,        'stack-list-frames -> override-stack-list-frames'),
     ]
 
 
