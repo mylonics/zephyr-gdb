@@ -59,6 +59,29 @@ _hw_active_lwp = None  # LWP of the thread actually executing on hardware
 # Discovery mode: 'auto' (default), 'symbols', 'hardcoded'
 _discovery_mode = os.environ.get('ZEPHYR_GDB_DISCOVERY_MODE', 'auto').lower()
 
+# Thread source: 'native' (probe RTOS list, e.g. BMP), 'kernel' (walk _kernel.threads), 'auto'
+_thread_source = os.environ.get('ZEPHYR_GDB_THREAD_SOURCE', 'auto').lower()
+
+# Zephyr thread state bit-flags (from include/zephyr/kernel.h)
+_ZEPHYR_THREAD_STATE_BITS = [
+    (1 << 0, 'dummy'),
+    (1 << 1, 'pending'),
+    (1 << 2, 'prestart'),
+    (1 << 3, 'dead'),
+    (1 << 4, 'suspended'),
+    (1 << 5, 'aborting'),
+    (1 << 6, 'suspending'),
+    (1 << 7, 'queued'),
+]
+
+
+def _format_thread_state(state):
+    """Return a human-readable string for a Zephyr thread_state bitmask."""
+    if state == 0:
+        return 'running'
+    parts = [name for bit, name in _ZEPHYR_THREAD_STATE_BITS if state & bit]
+    return '+'.join(parts) if parts else f'0x{state:x}'
+
 
 def _get_native_gdb_thread_name(thread_ptr):
     """Return the thread name from GDB's native inferior thread list.
@@ -98,8 +121,9 @@ class ZephyrThread:
         self.lwp = ZephyrThread.next_lwp
         ZephyrThread.next_lwp += 1
         self.active = False
+        self.native_thread = None  # Set in native discovery mode; enables safe thread switching
         self._update()
-    
+
     def _update(self):
         """Update thread information from target memory"""
         try:
@@ -107,7 +131,7 @@ class ZephyrThread:
             
             # Extract thread name if available
             try:
-                if 'name' in thread.type.fields():
+                if 'name' in [f.name for f in thread.type.fields()]:
                     self.name = thread['name'].string()
                 else:
                     self.name = None
@@ -383,103 +407,208 @@ def get_kernel_offsets():
     return get_hardcoded_offsets()
 
 
-def discover_threads(verbose=True):
-    """Traverse the kernel thread list and populate thread_cache.
+def _discover_threads_native(verbose=True):
+    """Enumerate threads from GDB's native inferior thread list (e.g. BMP RTOS support).
 
-    verbose=False suppresses warnings during initial load when the
-    inferior may not be running yet.
+    When a debug probe has built-in Zephyr RTOS support (e.g. Black Magic Probe)
+    it reports each Zephyr k_thread as a separate GDB inferior thread.  This
+    function reads that list, augments each entry with Zephyr metadata from the
+    kernel structs, and populates thread_cache.
 
-    Uses ``_cached_offsets`` which must have been set previously by
-    ``get_kernel_offsets()`` (called at script load / ``zephyr-discovery``).
+    Returns True if native RTOS threads were found and the cache was populated.
+    Returns False if the probe has no RTOS thread list (caller should fall back).
+    """
+    global thread_cache, _hw_active_lwp
+
+    try:
+        inf_threads = gdb.selected_inferior().threads()
+    except Exception:
+        return False
+
+    # If the probe has no RTOS support there is only one hardware thread,
+    # usually unnamed.  Fall back to the kernel walk.
+    if not inf_threads:
+        return False
+    if len(inf_threads) == 1 and not inf_threads[0].name:
+        return False
+
+    arch = detect_architecture()
+    old_thread_set = set(str(t.thread_ptr) for t in thread_cache)
+
+    try:
+        selected_inf_thread = gdb.selected_thread()
+    except Exception:
+        selected_inf_thread = None
+
+    new_thread_list = []
+    for inf_thread in inf_threads:
+        # BMP stores the k_thread address as ptid[1] (lwp); ptid[2] (tid) is a fallback.
+        thread_addr = inf_thread.ptid[1] or inf_thread.ptid[2]
+        if not thread_addr:
+            continue
+
+        # Build ZephyrThread bypassing __init__ (we set all fields manually)
+        zt = object.__new__(ZephyrThread)
+        zt.offsets = None
+        zt.arch = arch
+        zt.lwp = ZephyrThread.next_lwp
+        ZephyrThread.next_lwp += 1
+        zt.active = (inf_thread is selected_inf_thread)
+        zt.native_thread = inf_thread          # enables safe thread context switching
+        zt.name = inf_thread.name or f"thread_{thread_addr:x}"
+        zt.state = 0
+        zt.prio = 0
+        zt.callee_saved = None
+        zt.frame_str = "??"
+
+        # Obtain a typed pointer to k_thread for metadata augmentation
+        thread_ptr = None
+        try:
+            k_thread_ptr_type = gdb.lookup_type('struct k_thread').pointer()
+            thread_ptr = gdb.Value(thread_addr).cast(k_thread_ptr_type)
+        except gdb.error:
+            try:
+                thread_ptr = gdb.Value(thread_addr)
+            except Exception:
+                pass
+
+        zt.thread_ptr = thread_ptr if thread_ptr is not None else gdb.Value(thread_addr)
+
+        # Augment with Zephyr struct metadata (state, priority, callee-saved)
+        if thread_ptr is not None:
+            try:
+                ts = thread_ptr.dereference()
+                try:
+                    zt.state = int(ts['base']['thread_state'])
+                except Exception:
+                    pass
+                try:
+                    zt.prio = int(ts['base']['prio'])
+                except Exception:
+                    pass
+                # Use Zephyr struct name when BMP did not supply one
+                if not inf_thread.name:
+                    try:
+                        if 'name' in [f.name for f in ts.type.fields()]:
+                            zt.name = ts['name'].string() or zt.name
+                    except Exception:
+                        pass
+                try:
+                    zt.callee_saved = ts['callee_saved']
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Frame string for display
+        if zt.active:
+            try:
+                frame = gdb.newest_frame()
+                zt.frame_str = f"0x{frame.pc():x} in {frame.name() or '??'}()"
+            except Exception:
+                pass
+        elif zt.callee_saved is not None and arch:
+            try:
+                pc = arch.get_thread_pc(zt.callee_saved)
+                if pc and _is_valid_code_addr(pc):
+                    try:
+                        block = gdb.block_for_pc(pc)
+                        while block and block.function is None:
+                            block = block.superblock
+                        func_name = str(block.function) if block and block.function else "??"
+                    except Exception:
+                        func_name = "??"
+                    zt.frame_str = f"0x{pc:x} in {func_name}()"
+            except Exception:
+                pass
+
+        if str(zt.thread_ptr) not in old_thread_set:
+            print(f"[New thread '{zt.name}' (LWP {zt.lwp})]")
+        new_thread_list.append(zt)
+
+    if not new_thread_list:
+        return False
+
+    thread_cache = new_thread_list
+    _hw_active_lwp = None
+    for t in thread_cache:
+        if t.active:
+            _hw_active_lwp = t.lwp
+            break
+    return True
+
+
+def _discover_threads_kernel(verbose=True):
+    """Walk _kernel.threads to populate thread_cache (original kernel-walk implementation).
+
+    Requires CONFIG_THREAD_MONITOR=y and CONFIG_DEBUG_INFO=y in the Zephyr build.
+    Works with any debug probe regardless of RTOS support in probe firmware.
     """
     global thread_cache, current_thread_ptr, _hw_active_lwp
-    
-    # Reset LWP counter so IDs always start at 1
-    ZephyrThread.next_lwp = 1
-    
+
     try:
-        # Get architecture handler
         arch = detect_architecture()
-        
-        # Use cached offsets — discovery is done elsewhere
         offsets = _cached_offsets
-        
-        # Check if offsets are available
+
         if offsets is None:
             if verbose:
                 print("Thread discovery failed: No offsets available")
                 print("Run 'zephyr-discovery' to configure offset discovery")
             return
-        
-        # Try to read the kernel structure
+
         try:
             kernel = gdb.parse_and_eval('_kernel')
-        except:
+        except Exception:
             if verbose:
                 print("Warning: Could not find '_kernel' symbol")
                 print("Make sure you are debugging a Zephyr application")
                 print("and that CONFIG_DEBUG_INFO=y is set")
             return
-        # Try to get current thread
+
         try:
-            # Look for current thread in per-CPU structure
             current_thread_ptr = kernel['cpus'][0]['current']
-        except:
+        except Exception:
             try:
-                # Alternative: try direct current field
                 current_thread_ptr = kernel['current']
-            except:
+            except Exception:
                 if verbose:
                     print("Warning: Could not determine current thread")
                 current_thread_ptr = None
-        
-        # Try to get thread list
+
         try:
             thread_list_head = kernel['threads']
-        except:
+        except Exception:
             if verbose:
                 print("Warning: Could not find thread list in kernel structure")
                 print("Make sure CONFIG_THREAD_MONITOR=y is set in your Zephyr configuration")
             return
-        
+
         if not thread_list_head or int(thread_list_head) == 0:
             if verbose:
                 print("Warning: Thread list is empty")
             return
-        
-        # Traverse the thread list
+
         new_thread_list = []
         current_ptr = thread_list_head
-        max_threads = 100  # Safety limit to prevent infinite loops
-        
+        max_threads = 100
+        old_thread_set = set(str(t.thread_ptr) for t in thread_cache)
+
         while current_ptr and int(current_ptr) != 0 and len(new_thread_list) < max_threads:
-            # Create or update thread object
             zt = ZephyrThread(current_ptr, offsets, arch)
             new_thread_list.append(zt)
-            
-            # Get next thread pointer
             try:
                 thread_struct = current_ptr.dereference()
                 current_ptr = thread_struct['next_thread']
-                
-                # Check if we've looped back to the start
                 if current_ptr == thread_list_head:
                     break
-            except:
-                # End of list or error
+            except Exception:
                 break
-        
-        # Update global thread cache
-        old_thread_set = set(str(t.thread_ptr) for t in thread_cache)
-        
-        # Announce new threads
+
         for t in new_thread_list:
             if str(t.thread_ptr) not in old_thread_set:
                 print(f"[New thread '{t.name}' (LWP {t.lwp})]")
-        
-        thread_cache = new_thread_list
 
-        # Record which thread is hardware-active (actually running on CPU)
+        thread_cache = new_thread_list
         _hw_active_lwp = None
         for t in thread_cache:
             if t.active:
@@ -488,12 +617,36 @@ def discover_threads(verbose=True):
 
         if len(thread_cache) == 0 and verbose:
             print("Warning: No threads discovered")
-        
+
     except Exception as e:
         if verbose:
             print(f"Error discovering threads: {e}")
             import traceback
             traceback.print_exc()
+
+
+def discover_threads(verbose=True):
+    """Populate thread_cache by dispatching to native or kernel discovery.
+
+    Native mode  — reads probe's own RTOS thread list (BMP, fastest, no kernel walk).
+    Kernel mode  — walks _kernel.threads directly (any probe, needs CONFIG_THREAD_MONITOR=y).
+    Auto (default) — tries native first; falls back to kernel if probe has no RTOS threads.
+
+    verbose=False suppresses warnings (used during initial load / stop events).
+    """
+    ZephyrThread.next_lwp = 1
+
+    if _thread_source in ('native', 'auto'):
+        if _discover_threads_native(verbose=False):
+            return
+        if _thread_source == 'native':
+            if verbose:
+                print("Zephyr GDB: native discovery found no RTOS threads.")
+                print("Enable RTOS support in probe firmware or: zephyr-thread-source kernel")
+            return
+        # auto: fall through to kernel walk
+
+    _discover_threads_kernel(verbose)
 
 
 def stop_handler(event=None):
@@ -541,14 +694,11 @@ class CommandInfoThreads(gdb.Command):
             print("No threads.")
             return
         
-        print("  Id   Target Id            Prio State Frame")
+        print("  Id   Target Id            Prio State        Frame")
         for t in thread_cache:
-            # Format state
-            state_str = f"{t.state:3d}"
-            
-            # Format line
+            state_str = _format_thread_state(t.state)
             active_marker = '*' if t.active else ' '
-            print(f"{active_marker} {t.lwp:<4d} {t.name:<20s} {t.prio:4d} {state_str:5s} {t.frame_str}")
+            print(f"{active_marker} {t.lwp:<4d} {t.name:<20s} {t.prio:4d} {state_str:<12s} {t.frame_str}")
 
 
 class CommandThread(gdb.Command):
@@ -630,6 +780,38 @@ class CommandZephyrDiscovery(gdb.Command):
             print(f"Zephyr discovery mode set to '{_discovery_mode}' (offsets updated)")
         else:
             print(f"Zephyr discovery mode set to '{_discovery_mode}' (offset discovery failed)")
+
+
+class CommandZephyrThreadSource(gdb.Command):
+    """Set the Zephyr thread enumeration source at runtime.
+
+    Usage: zephyr-thread-source [native|kernel|auto]
+
+      native  - Use probe's thread list (e.g. BMP RTOS support). Fastest; no
+                kernel walk; uses probe-native stack unwinding.  Requires the
+                probe firmware to have Zephyr RTOS support compiled in.
+      kernel  - Walk _kernel.threads directly.  Works with any probe.
+                Requires CONFIG_THREAD_MONITOR=y and CONFIG_DEBUG_INFO=y.
+      auto    - Try native first; fall back to kernel (default).
+
+    With no argument, prints the current mode.
+    """
+
+    def __init__(self):
+        super(CommandZephyrThreadSource, self).__init__('zephyr-thread-source', gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty=False):
+        global _thread_source
+        arg = arg.strip().lower()
+        if not arg:
+            print(f"Zephyr thread source: {_thread_source}")
+            return
+        if arg not in ('native', 'kernel', 'auto'):
+            print(f"Unknown source '{arg}'. Valid modes: native, kernel, auto")
+            return
+        _thread_source = arg
+        print(f"Zephyr thread source set to '{_thread_source}'")
+        discover_threads(verbose=True)
 
 
 # ---------------------------------------------------------------------------
@@ -729,21 +911,24 @@ _real_cpu_regs = None  # dict {"sp": int, "pc": int} or None
 
 
 def _switch_thread_context(target_thread):
-    """Set SP/PC registers to *target_thread*'s saved context.
+    """Set the GDB thread context to *target_thread*.
 
-    Uses ``_hw_active_lwp`` (set by ``discover_threads`` on each stop) to
-    decide whether the target is the hardware-running thread.  This is
-    independent of the ``active`` flag which tracks the *selected* thread
-    for the UI.
+    In native mode (thread has a ``native_thread`` reference) uses GDB's own
+    thread-switch mechanism — safe, no register manipulation needed.
 
-    When switching to the hardware-active thread, restores the real CPU
-    registers saved earlier.  When switching to any other (suspended)
-    thread, saves the current CPU registers (if not saved already) and
-    sets SP/PC to the thread's callee-saved values so native GDB commands
-    operate in the correct context.
+    In kernel mode falls back to the manual $sp/$pc injection approach.
     """
     global _real_cpu_regs
 
+    # Native mode: use GDB's built-in thread switch — no fragile register writes
+    if getattr(target_thread, 'native_thread', None) is not None:
+        try:
+            target_thread.native_thread.switch()
+        except Exception:
+            pass
+        return
+
+    # Kernel mode: manual $sp/$pc manipulation
     if target_thread.lwp == _hw_active_lwp:
         # Switching back to the hardware-running thread — restore original regs
         if _real_cpu_regs is not None:
@@ -856,22 +1041,57 @@ def _build_frame_list(thread, low=None, high=None):
         except Exception:
             frames.append(_build_frame_dict(thread, include_args=False))
     else:
-        # Suspended thread — try to unwind via GDB by temporarily
-        # setting SP and PC to the thread's saved context.
+        # Suspended thread
         unwound = False
-        if thread.callee_saved is not None and thread.arch:
+
+        # Native mode: use GDB's thread switch for correct, safe unwinding
+        if getattr(thread, 'native_thread', None) is not None:
+            try:
+                orig_thread = gdb.selected_thread()
+                thread.native_thread.switch()
+                try:
+                    frame = gdb.newest_frame()
+                    level = 0
+                    while frame is not None:
+                        pc = frame.pc()
+                        if not _is_valid_code_addr(pc):
+                            break
+                        if (low is None or level >= low) and (high is None or level <= high):
+                            fd = {"level": str(level), "addr": f"0x{pc:x}",
+                                  "func": frame.name() or "??"}
+                            sal = frame.find_sal()
+                            if sal.symtab:
+                                fd["file"] = sal.symtab.filename
+                                fd["fullname"] = sal.symtab.fullname()
+                                fd["line"] = str(sal.line)
+                            try:
+                                fd["arch"] = frame.architecture().name()
+                            except Exception:
+                                pass
+                            frames.append(fd)
+                        level += 1
+                        try:
+                            frame = frame.older()
+                        except gdb.error:
+                            break
+                    if frames:
+                        unwound = True
+                finally:
+                    if orig_thread is not None:
+                        orig_thread.switch()
+            except Exception:
+                pass
+
+        # Kernel mode: temporarily set $sp/$pc to unwind
+        if not unwound and thread.callee_saved is not None and thread.arch:
             saved_pc = thread.arch.get_thread_pc(thread.callee_saved)
             saved_sp = thread.arch.get_thread_sp(thread.callee_saved)
             if saved_pc and saved_sp:
                 try:
-                    # Save current register values
                     orig_sp = int(gdb.parse_and_eval('$sp'))
                     orig_pc = int(gdb.parse_and_eval('$pc'))
-
-                    # Temporarily set SP/PC to the suspended thread's context
                     gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
                     gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
-
                     try:
                         frame = gdb.newest_frame()
                         level = 0
@@ -1187,7 +1407,8 @@ try:
     cmd_info_threads = CommandInfoThreads()
     cmd_thread = CommandThread()
     cmd_zephyr_discovery = CommandZephyrDiscovery()
-except:
+    cmd_zephyr_thread_source = CommandZephyrThreadSource()
+except Exception:
     print("Warning: Failed to register custom commands")
 
 # Register MI commands from the centralized registry (requires GDB 12+)
@@ -1207,8 +1428,10 @@ else:
 
 # Try initial thread discovery (silent mode - don't print warnings during load)
 print("=" * 70)
-print("Use 'info threads' to see Zephyr threads")
-print("Use 'zephyr-discovery [auto|symbols|hardcoded]' to set discovery mode")
+print("Zephyr RTOS GDB Extension loaded")
+print("  info threads              - list all Zephyr threads")
+print("  zephyr-thread-source      - set thread enumeration mode (native/kernel/auto)")
+print("  zephyr-discovery          - set offset discovery mode (auto/symbols/hardcoded)")
 print("=" * 70)
 print()
 
