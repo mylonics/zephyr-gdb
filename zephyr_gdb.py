@@ -103,13 +103,13 @@ def _get_native_gdb_thread_name(thread_ptr):
 
 class ZephyrThread:
     """Represents a single Zephyr thread"""
-    
+
     next_lwp = 1  # Light-weight process ID counter
-    
+
     def __init__(self, thread_ptr, offsets, arch):
         """
         Initialize a Zephyr thread object
-        
+
         Args:
             thread_ptr: gdb.Value pointer to k_thread structure
             offsets: Dictionary of structure offsets
@@ -128,7 +128,7 @@ class ZephyrThread:
         """Update thread information from target memory"""
         try:
             thread = self.thread_ptr.dereference()
-            
+
             # Extract thread name if available
             try:
                 if 'name' in [f.name for f in thread.type.fields()]:
@@ -141,28 +141,28 @@ class ZephyrThread:
             if not self.name:
                 self.name = (_get_native_gdb_thread_name(self.thread_ptr)
                              or f"thread_{int(self.thread_ptr):x}")
-            
+
             # Extract thread state
             try:
                 self.state = int(thread['base']['thread_state'])
             except:
                 self.state = 0
-            
+
             # Extract priority
             try:
                 self.prio = int(thread['base']['prio'])
             except:
                 self.prio = 0
-            
+
             # Extract callee-saved registers
             try:
                 self.callee_saved = thread['callee_saved']
             except:
                 self.callee_saved = None
-            
+
             # Update frame information
             self._update_frame()
-            
+
         except Exception as e:
             print(f"Warning: Failed to update thread {self.thread_ptr}: {e}")
             self.name = (_get_native_gdb_thread_name(self.thread_ptr)
@@ -170,11 +170,11 @@ class ZephyrThread:
             self.state = 0
             self.prio = 0
             self.frame_str = "??"
-    
+
     def _update_frame(self):
         """Update stack frame information for this thread"""
         global current_thread_ptr, reg_cache
-        
+
         if self.thread_ptr == current_thread_ptr:
             # This is the current thread - use actual CPU state
             self.active = True
@@ -214,6 +214,10 @@ class ArchitectureHandler:
         """Return the saved stack pointer for a suspended thread, or 0."""
         return 0
 
+    def get_thread_lr(self, callee_saved):
+        """Return the saved link register for a suspended thread, or 0."""
+        return 0
+
     def _probe_field(self, callee_saved, *fields):
         """Return int value of the first matching field name found in callee_saved."""
         try:
@@ -229,6 +233,12 @@ class ArchitectureHandler:
 class ARMCortexMHandler(ArchitectureHandler):
     """ARM Cortex-M specific handling"""
 
+    # ARM Cortex-M hardware exception frame layout (pushed to PSP by hardware on exception entry):
+    # psp+0:  r0    psp+4:  r1    psp+8:  r2    psp+12: r3
+    # psp+16: r12   psp+20: lr    psp+24: pc    psp+28: xpsr
+    # Total: 8 registers × 4 bytes = 32 bytes
+    # callee_saved.psp is the PSP value AFTER the hardware pushed this frame.
+
     def get_thread_pc(self, callee_saved):
         try:
             if 'psp' in [f.name for f in callee_saved.type.fields()]:
@@ -240,10 +250,25 @@ class ARMCortexMHandler(ArchitectureHandler):
         return 0
 
     def get_thread_sp(self, callee_saved):
+        """Return SP at time of interruption (past the hardware exception frame)."""
         try:
-            return self._probe_field(callee_saved, 'psp', 'sp')
+            if 'psp' in [f.name for f in callee_saved.type.fields()]:
+                psp = int(callee_saved['psp'])
+                return psp + 32  # Skip hardware exception frame (8 regs × 4 bytes)
         except Exception:
-            return 0
+            pass
+        return 0
+
+    def get_thread_lr(self, callee_saved):
+        """Return LR from the hardware exception frame (needed for DWARF frame unwinding)."""
+        try:
+            if 'psp' in [f.name for f in callee_saved.type.fields()]:
+                psp = int(callee_saved['psp'])
+                lr_bytes = gdb.selected_inferior().read_memory(psp + 20, 4)
+                return struct.unpack('<I', lr_bytes)[0]
+        except Exception:
+            pass
+        return 0
 
 
 class x86Handler(ArchitectureHandler):
@@ -273,15 +298,15 @@ class RISCVHandler(ArchitectureHandler):
 def detect_architecture():
     """
     Detect target architecture from GDB
-    
+
     Returns:
         ArchitectureHandler instance for the detected architecture
-        
+
     Note: Falls back to ARMCortexMHandler for unknown architectures
     """
     try:
         arch_str = gdb.execute('show architecture', to_string=True).lower()
-        
+
         if 'arm' in arch_str or 'cortex' in arch_str:
             return ARMCortexMHandler()
         elif 'i386' in arch_str or 'x86-64' in arch_str:
@@ -657,6 +682,8 @@ def stop_handler(event=None):
         try:
             gdb.execute(f'set $sp = 0x{_real_cpu_regs["sp"]:x}', to_string=True)
             gdb.execute(f'set $pc = 0x{_real_cpu_regs["pc"]:x}', to_string=True)
+            if _real_cpu_regs.get("lr"):
+                gdb.execute(f'set $lr = 0x{_real_cpu_regs["lr"]:x}', to_string=True)
         except Exception:
             pass
         _real_cpu_regs = None
@@ -681,19 +708,19 @@ def exit_handler(event=None):
 class CommandInfoThreads(gdb.Command):
     """
     Override for GDB's 'info threads' command
-    
+
     Displays all Zephyr threads with their state and current frame.
     """
-    
+
     def __init__(self):
         super(CommandInfoThreads, self).__init__('info threads', gdb.COMMAND_USER)
-    
+
     def invoke(self, arg, from_tty=False):
         """Execute the command"""
         if len(thread_cache) == 0:
             print("No threads.")
             return
-        
+
         print("  Id   Target Id            Prio State        Frame")
         for t in thread_cache:
             state_str = _format_thread_state(t.state)
@@ -704,13 +731,13 @@ class CommandInfoThreads(gdb.Command):
 class CommandThread(gdb.Command):
     """
     Override for GDB's 'thread' command
-    
+
     Allows switching between Zephyr threads for inspection.
     """
-    
+
     def __init__(self):
         super(CommandThread, self).__init__('thread', gdb.COMMAND_USER)
-    
+
     def invoke(self, arg, from_tty=False):
         """Execute the command"""
         if not arg:
@@ -721,14 +748,14 @@ class CommandThread(gdb.Command):
                     return
             print("No current thread")
             return
-        
+
         # Switch to specified thread
         try:
             target_lwp = int(arg)
         except ValueError:
             print(f"Invalid thread ID: {arg}")
             return
-        
+
         found = False
         for t in thread_cache:
             if t.lwp == target_lwp:
@@ -740,7 +767,7 @@ class CommandThread(gdb.Command):
             elif t.active:
                 # Deactivate previously active thread
                 t.active = False
-        
+
         if not found:
             print(f"Thread ID {target_lwp} not known.")
 
@@ -935,15 +962,19 @@ def _switch_thread_context(target_thread):
         if target_thread.callee_saved is not None and target_thread.arch:
             saved_pc = target_thread.arch.get_thread_pc(target_thread.callee_saved)
             saved_sp = target_thread.arch.get_thread_sp(target_thread.callee_saved)
+            saved_lr = target_thread.arch.get_thread_lr(target_thread.callee_saved)
             if saved_pc and saved_sp:
                 try:
                     if _real_cpu_regs is None:
                         _real_cpu_regs = {
                             "sp": int(gdb.parse_and_eval('$sp')),
                             "pc": int(gdb.parse_and_eval('$pc')),
+                            "lr": int(gdb.parse_and_eval('$lr')) if saved_lr else 0,
                         }
                     gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
                     gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
+                    if saved_lr:
+                        gdb.execute(f'set $lr = 0x{saved_lr:x}', to_string=True)
                 except Exception:
                     pass
 
@@ -1042,14 +1073,18 @@ def _build_frame_list(thread, low=None, high=None):
         if thread.callee_saved is not None and thread.arch:
             saved_pc = thread.arch.get_thread_pc(thread.callee_saved)
             saved_sp = thread.arch.get_thread_sp(thread.callee_saved)
+            saved_lr = thread.arch.get_thread_lr(thread.callee_saved)
             if saved_pc and saved_sp:
                 try:
                     orig_sp = int(gdb.parse_and_eval('$sp'))
                     orig_pc = int(gdb.parse_and_eval('$pc'))
+                    orig_lr = int(gdb.parse_and_eval('$lr')) if saved_lr else 0
                     gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
                     gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
+                    if saved_lr:
+                        gdb.execute(f'set $lr = 0x{saved_lr:x}', to_string=True)
                     # Flush GDB's frame cache so newest_frame() reflects the
-                    # new $sp/$pc rather than the cached active-thread frames.
+                    # new $sp/$pc/$lr rather than the cached active-thread frames.
                     gdb.invalidate_cached_frames()
                     try:
                         frame = gdb.newest_frame()
@@ -1084,6 +1119,8 @@ def _build_frame_list(thread, low=None, high=None):
                         # subsequent operations see the real active-thread frames.
                         gdb.execute(f'set $sp = 0x{orig_sp:x}', to_string=True)
                         gdb.execute(f'set $pc = 0x{orig_pc:x}', to_string=True)
+                        if saved_lr:
+                            gdb.execute(f'set $lr = 0x{orig_lr:x}', to_string=True)
                         gdb.invalidate_cached_frames()
                 except Exception:
                     pass
