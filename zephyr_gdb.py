@@ -954,6 +954,8 @@ def _switch_thread_context(target_thread):
             try:
                 gdb.execute(f'set $sp = 0x{_real_cpu_regs["sp"]:x}', to_string=True)
                 gdb.execute(f'set $pc = 0x{_real_cpu_regs["pc"]:x}', to_string=True)
+                if _real_cpu_regs.get("lr"):
+                    gdb.execute(f'set $lr = 0x{_real_cpu_regs["lr"]:x}', to_string=True)
             except Exception:
                 pass
             _real_cpu_regs = None
@@ -1040,26 +1042,43 @@ def _build_frame_list(thread, low=None, high=None):
             frame = gdb.newest_frame()
             level = 0
             while frame is not None:
-                pc = frame.pc()
+                if not frame.is_valid():
+                    break
+                try:
+                    pc = frame.pc()
+                except Exception:
+                    break
                 if not _is_valid_code_addr(pc):
                     break
                 if (low is None or level >= low) and (high is None or level <= high):
-                    fd = {"level": str(level), "addr": f"0x{pc:x}",
-                          "func": frame.name() or "??"}
-                    sal = frame.find_sal()
-                    if sal.symtab:
-                        fd["file"] = sal.symtab.filename
-                        fd["fullname"] = sal.symtab.fullname()
-                        fd["line"] = str(sal.line)
+                    fd = {"level": str(level), "addr": f"0x{pc:x}", "func": "??"}
+                    try:
+                        fd["func"] = frame.name() or "??"
+                    except Exception:
+                        pass
+                    try:
+                        sal = frame.find_sal()
+                        if sal.symtab:
+                            fd["file"] = sal.symtab.filename
+                            fd["fullname"] = sal.symtab.fullname()
+                            fd["line"] = str(sal.line)
+                    except Exception:
+                        pass
                     try:
                         fd["arch"] = frame.architecture().name()
                     except Exception:
                         pass
                     frames.append(fd)
                 level += 1
+                # Stop walking once we have passed the requested upper bound.
+                # Without this the loop continues indefinitely calling
+                # frame.older() far beyond the requested depth, which can
+                # read corrupt stack data and hang GDB on memory accesses.
+                if high is not None and level > high:
+                    break
                 try:
                     frame = frame.older()
-                except gdb.error:
+                except Exception:
                     break
         except Exception:
             frames.append(_build_frame_dict(thread, include_args=False))
@@ -1095,27 +1114,41 @@ def _build_frame_list(thread, low=None, high=None):
                     frame = gdb.newest_frame()
                     level = 0
                     while frame is not None:
-                        pc = frame.pc()
+                        if not frame.is_valid():
+                            break
+                        try:
+                            pc = frame.pc()
+                        except Exception:
+                            break
                         if not _is_valid_code_addr(pc):
                             break
                         if (low is None or level >= low) and (high is None or level <= high):
                             fd = {"level": str(level),
                                   "addr": f"0x{pc:x}",
-                                  "func": frame.name() or "??"}
-                            sal = frame.find_sal()
-                            if sal.symtab:
-                                fd["file"] = sal.symtab.filename
-                                fd["fullname"] = sal.symtab.fullname()
-                                fd["line"] = str(sal.line)
+                                  "func": "??"}
+                            try:
+                                fd["func"] = frame.name() or "??"
+                            except Exception:
+                                pass
+                            try:
+                                sal = frame.find_sal()
+                                if sal.symtab:
+                                    fd["file"] = sal.symtab.filename
+                                    fd["fullname"] = sal.symtab.fullname()
+                                    fd["line"] = str(sal.line)
+                            except Exception:
+                                pass
                             try:
                                 fd["arch"] = frame.architecture().name()
                             except Exception:
                                 pass
                             frames.append(fd)
                         level += 1
+                        if high is not None and level > high:
+                            break
                         try:
                             frame = frame.older()
-                        except gdb.error:
+                        except Exception:
                             break
                     if frames:
                         unwound = True
@@ -1349,6 +1382,7 @@ if hasattr(gdb, 'MICommand'):
 
         def invoke(self, argv):
             global _real_cpu_regs
+            # Restore hardware registers
             if _real_cpu_regs is not None:
                 try:
                     gdb.execute(f'set $sp = 0x{_real_cpu_regs["sp"]:x}', to_string=True)
@@ -1360,6 +1394,12 @@ if hasattr(gdb, 'MICommand'):
                     pass
                 _real_cpu_regs = None
                 gdb.invalidate_cached_frames()
+            # Restore active flags to reflect the true hardware state.
+            # _switch_thread_context() may have flipped the active flags when
+            # serving a preSelectThread command; reset them from _hw_active_lwp.
+            if _hw_active_lwp is not None and thread_cache:
+                for t in thread_cache:
+                    t.active = (t.lwp == _hw_active_lwp)
             return {}
 
     class MIOverrideStackListFrames(gdb.MICommand):
