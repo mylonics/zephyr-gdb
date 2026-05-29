@@ -60,6 +60,24 @@ _hw_active_lwp = None  # LWP of the thread actually executing on hardware
 _discovery_mode = os.environ.get('ZEPHYR_GDB_DISCOVERY_MODE', 'auto').lower()
 
 
+def _get_native_gdb_thread_name(thread_ptr):
+    """Return the thread name from GDB's native inferior thread list.
+
+    When a debug probe (e.g. Black Magic Probe) has its own RTOS support it
+    exposes Zephyr thread names to GDB directly.  The thread struct address is
+    used as either the lwp or tid component of the ptid, so we match on both.
+    """
+    try:
+        addr = int(thread_ptr)
+        for inf_thread in gdb.selected_inferior().threads():
+            if addr in inf_thread.ptid[1:]:  # check lwp and tid fields
+                if inf_thread.name:
+                    return inf_thread.name
+    except Exception:
+        pass
+    return None
+
+
 class ZephyrThread:
     """Represents a single Zephyr thread"""
     
@@ -92,9 +110,13 @@ class ZephyrThread:
                 if 'name' in thread.type.fields():
                     self.name = thread['name'].string()
                 else:
-                    self.name = f"thread_{self.thread_ptr}"
+                    self.name = None
             except:
-                self.name = f"thread_{self.thread_ptr}"
+                self.name = None
+            # Fall back to the name GDB obtained via probe RTOS support (e.g. BMP)
+            if not self.name:
+                self.name = (_get_native_gdb_thread_name(self.thread_ptr)
+                             or f"thread_{int(self.thread_ptr):x}")
             
             # Extract thread state
             try:
@@ -119,7 +141,8 @@ class ZephyrThread:
             
         except Exception as e:
             print(f"Warning: Failed to update thread {self.thread_ptr}: {e}")
-            self.name = f"thread_{self.thread_ptr}"
+            self.name = (_get_native_gdb_thread_name(self.thread_ptr)
+                         or f"thread_{int(self.thread_ptr):x}")
             self.state = 0
             self.prio = 0
             self.frame_str = "??"
@@ -956,10 +979,12 @@ if hasattr(gdb, 'MICommand'):
                 if filter_id is not None and t.lwp != filter_id:
                     continue
 
+                thread_name = t.name or f"thread_{t.lwp}"
                 thread_dict = {
                     "id": str(t.lwp),
-                    "target-id": f"Zephyr thread {t.lwp} ({t.name})",
-                    "name": t.name or f"thread_{t.lwp}",
+                    "target-id": f"Zephyr thread {t.lwp} ({thread_name})",
+                    "name": thread_name,
+                    "details": f"prio:{t.prio}",
                     "state": "stopped",
                     "frame": _build_frame_dict(t),
                 }
