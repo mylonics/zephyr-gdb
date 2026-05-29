@@ -1048,6 +1048,9 @@ def _build_frame_list(thread, low=None, high=None):
                     orig_pc = int(gdb.parse_and_eval('$pc'))
                     gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
                     gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
+                    # Flush GDB's frame cache so newest_frame() reflects the
+                    # new $sp/$pc rather than the cached active-thread frames.
+                    gdb.invalidate_cached_frames()
                     try:
                         frame = gdb.newest_frame()
                         level = 0
@@ -1077,9 +1080,11 @@ def _build_frame_list(thread, low=None, high=None):
                         if frames:
                             unwound = True
                     finally:
-                        # Always restore original registers
+                        # Always restore original registers and re-flush so
+                        # subsequent operations see the real active-thread frames.
                         gdb.execute(f'set $sp = 0x{orig_sp:x}', to_string=True)
                         gdb.execute(f'set $pc = 0x{orig_pc:x}', to_string=True)
+                        gdb.invalidate_cached_frames()
                 except Exception:
                     pass
 
