@@ -911,24 +911,16 @@ _real_cpu_regs = None  # dict {"sp": int, "pc": int} or None
 
 
 def _switch_thread_context(target_thread):
-    """Set the GDB thread context to *target_thread*.
+    """Set register context to *target_thread*'s saved context.
 
-    In native mode (thread has a ``native_thread`` reference) uses GDB's own
-    thread-switch mechanism — safe, no register manipulation needed.
-
-    In kernel mode falls back to the manual $sp/$pc injection approach.
+    Always uses the $sp/$pc manipulation approach.  Calling
+    ``native_thread.switch()`` on a suspended thread causes the probe to
+    attempt a register read for a thread that is not executing on the CPU;
+    Black Magic Probe hangs waiting for a response that never arrives, which
+    blocks the GDB MI command queue and makes pause/reset unresponsive.
     """
     global _real_cpu_regs
 
-    # Native mode: use GDB's built-in thread switch — no fragile register writes
-    if getattr(target_thread, 'native_thread', None) is not None:
-        try:
-            target_thread.native_thread.switch()
-        except Exception:
-            pass
-        return
-
-    # Kernel mode: manual $sp/$pc manipulation
     if target_thread.lwp == _hw_active_lwp:
         # Switching back to the hardware-running thread — restore original regs
         if _real_cpu_regs is not None:
@@ -1041,49 +1033,13 @@ def _build_frame_list(thread, low=None, high=None):
         except Exception:
             frames.append(_build_frame_dict(thread, include_args=False))
     else:
-        # Suspended thread
+        # Suspended thread — temporarily set $sp/$pc to the thread's saved
+        # context, walk frames, then restore.  We deliberately avoid calling
+        # native_thread.switch() here: doing so causes the probe to attempt a
+        # register read for a suspended thread, which hangs BMP.
         unwound = False
 
-        # Native mode: use GDB's thread switch for correct, safe unwinding
-        if getattr(thread, 'native_thread', None) is not None:
-            try:
-                orig_thread = gdb.selected_thread()
-                thread.native_thread.switch()
-                try:
-                    frame = gdb.newest_frame()
-                    level = 0
-                    while frame is not None:
-                        pc = frame.pc()
-                        if not _is_valid_code_addr(pc):
-                            break
-                        if (low is None or level >= low) and (high is None or level <= high):
-                            fd = {"level": str(level), "addr": f"0x{pc:x}",
-                                  "func": frame.name() or "??"}
-                            sal = frame.find_sal()
-                            if sal.symtab:
-                                fd["file"] = sal.symtab.filename
-                                fd["fullname"] = sal.symtab.fullname()
-                                fd["line"] = str(sal.line)
-                            try:
-                                fd["arch"] = frame.architecture().name()
-                            except Exception:
-                                pass
-                            frames.append(fd)
-                        level += 1
-                        try:
-                            frame = frame.older()
-                        except gdb.error:
-                            break
-                    if frames:
-                        unwound = True
-                finally:
-                    if orig_thread is not None:
-                        orig_thread.switch()
-            except Exception:
-                pass
-
-        # Kernel mode: temporarily set $sp/$pc to unwind
-        if not unwound and thread.callee_saved is not None and thread.arch:
+        if thread.callee_saved is not None and thread.arch:
             saved_pc = thread.arch.get_thread_pc(thread.callee_saved)
             saved_sp = thread.arch.get_thread_sp(thread.callee_saved)
             if saved_pc and saved_sp:
