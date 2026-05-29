@@ -1075,10 +1075,16 @@ def _build_frame_list(thread, low=None, high=None):
             saved_sp = thread.arch.get_thread_sp(thread.callee_saved)
             saved_lr = thread.arch.get_thread_lr(thread.callee_saved)
             if saved_pc and saved_sp:
+                # Read current register values before any modification.
+                # Use None sentinels so the finally block knows what to restore.
+                orig_sp = orig_pc = orig_lr = None
                 try:
                     orig_sp = int(gdb.parse_and_eval('$sp'))
                     orig_pc = int(gdb.parse_and_eval('$pc'))
-                    orig_lr = int(gdb.parse_and_eval('$lr')) if saved_lr else 0
+                    if saved_lr:
+                        orig_lr = int(gdb.parse_and_eval('$lr'))
+                    # Set thread context — everything from here to end-of-try
+                    # is covered by the finally so registers are always restored.
                     gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
                     gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
                     if saved_lr:
@@ -1086,44 +1092,53 @@ def _build_frame_list(thread, low=None, high=None):
                     # Flush GDB's frame cache so newest_frame() reflects the
                     # new $sp/$pc/$lr rather than the cached active-thread frames.
                     gdb.invalidate_cached_frames()
-                    try:
-                        frame = gdb.newest_frame()
-                        level = 0
-                        while frame is not None:
-                            pc = frame.pc()
-                            if not _is_valid_code_addr(pc):
-                                break
-                            if (low is None or level >= low) and (high is None or level <= high):
-                                fd = {"level": str(level),
-                                      "addr": f"0x{pc:x}",
-                                      "func": frame.name() or "??"}
-                                sal = frame.find_sal()
-                                if sal.symtab:
-                                    fd["file"] = sal.symtab.filename
-                                    fd["fullname"] = sal.symtab.fullname()
-                                    fd["line"] = str(sal.line)
-                                try:
-                                    fd["arch"] = frame.architecture().name()
-                                except Exception:
-                                    pass
-                                frames.append(fd)
-                            level += 1
+                    frame = gdb.newest_frame()
+                    level = 0
+                    while frame is not None:
+                        pc = frame.pc()
+                        if not _is_valid_code_addr(pc):
+                            break
+                        if (low is None or level >= low) and (high is None or level <= high):
+                            fd = {"level": str(level),
+                                  "addr": f"0x{pc:x}",
+                                  "func": frame.name() or "??"}
+                            sal = frame.find_sal()
+                            if sal.symtab:
+                                fd["file"] = sal.symtab.filename
+                                fd["fullname"] = sal.symtab.fullname()
+                                fd["line"] = str(sal.line)
                             try:
-                                frame = frame.older()
-                            except gdb.error:
-                                break
-                        if frames:
-                            unwound = True
-                    finally:
-                        # Always restore original registers and re-flush so
-                        # subsequent operations see the real active-thread frames.
-                        gdb.execute(f'set $sp = 0x{orig_sp:x}', to_string=True)
-                        gdb.execute(f'set $pc = 0x{orig_pc:x}', to_string=True)
-                        if saved_lr:
+                                fd["arch"] = frame.architecture().name()
+                            except Exception:
+                                pass
+                            frames.append(fd)
+                        level += 1
+                        try:
+                            frame = frame.older()
+                        except gdb.error:
+                            break
+                    if frames:
+                        unwound = True
+                finally:
+                    # Always restore original registers regardless of what threw.
+                    # Guard each individually so a failing restore doesn't skip
+                    # the others.
+                    if orig_sp is not None:
+                        try:
+                            gdb.execute(f'set $sp = 0x{orig_sp:x}', to_string=True)
+                        except Exception:
+                            pass
+                    if orig_pc is not None:
+                        try:
+                            gdb.execute(f'set $pc = 0x{orig_pc:x}', to_string=True)
+                        except Exception:
+                            pass
+                    if orig_lr is not None:
+                        try:
                             gdb.execute(f'set $lr = 0x{orig_lr:x}', to_string=True)
-                        gdb.invalidate_cached_frames()
-                except Exception:
-                    pass
+                        except Exception:
+                            pass
+                    gdb.invalidate_cached_frames()
 
         # Fallback: single synthetic frame from callee-saved context
         if not unwound:
