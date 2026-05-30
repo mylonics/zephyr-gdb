@@ -1027,9 +1027,9 @@ def _build_frame_list(thread, low=None, high=None):
     """Return a list of MI-compatible frame dicts for *thread*.
 
     For the active (currently executing) thread the real GDB frame chain
-    is walked.  For suspended threads we attempt to unwind the stack by
-    temporarily setting SP/PC to the saved context and walking GDB's
-    frame chain.  If that fails, a single synthetic frame is returned.
+    is walked.  For suspended threads a single synthetic frame is returned
+    from callee-saved data that was already fetched during thread
+    discovery — no new target communication is required.
 
     *low* / *high* optionally limit the returned frame range (inclusive,
     0-based).
@@ -1083,100 +1083,25 @@ def _build_frame_list(thread, low=None, high=None):
         except Exception:
             frames.append(_build_frame_dict(thread, include_args=False))
     else:
-        # Suspended thread — temporarily set $sp/$pc to the thread's saved
-        # context, walk frames, then restore.  We deliberately avoid calling
-        # native_thread.switch() here: doing so causes the probe to attempt a
-        # register read for a suspended thread, which hangs BMP.
-        unwound = False
-
-        if thread.callee_saved is not None and thread.arch:
-            saved_pc = thread.arch.get_thread_pc(thread.callee_saved)
-            saved_sp = thread.arch.get_thread_sp(thread.callee_saved)
-            saved_lr = thread.arch.get_thread_lr(thread.callee_saved)
-            if saved_pc and saved_sp:
-                # Read current register values before any modification.
-                # Use None sentinels so the finally block knows what to restore.
-                orig_sp = orig_pc = orig_lr = None
-                try:
-                    orig_sp = int(gdb.parse_and_eval('$sp'))
-                    orig_pc = int(gdb.parse_and_eval('$pc'))
-                    if saved_lr:
-                        orig_lr = int(gdb.parse_and_eval('$lr'))
-                    # Set thread context — everything from here to end-of-try
-                    # is covered by the finally so registers are always restored.
-                    gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
-                    gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
-                    if saved_lr:
-                        gdb.execute(f'set $lr = 0x{saved_lr:x}', to_string=True)
-                    # Flush GDB's frame cache so newest_frame() reflects the
-                    # new $sp/$pc/$lr rather than the cached active-thread frames.
-                    gdb.invalidate_cached_frames()
-                    frame = gdb.newest_frame()
-                    level = 0
-                    while frame is not None:
-                        if not frame.is_valid():
-                            break
-                        try:
-                            pc = frame.pc()
-                        except Exception:
-                            break
-                        if not _is_valid_code_addr(pc):
-                            break
-                        if (low is None or level >= low) and (high is None or level <= high):
-                            fd = {"level": str(level),
-                                  "addr": f"0x{pc:x}",
-                                  "func": "??"}
-                            try:
-                                fd["func"] = frame.name() or "??"
-                            except Exception:
-                                pass
-                            try:
-                                sal = frame.find_sal()
-                                if sal.symtab:
-                                    fd["file"] = sal.symtab.filename
-                                    fd["fullname"] = sal.symtab.fullname()
-                                    fd["line"] = str(sal.line)
-                            except Exception:
-                                pass
-                            try:
-                                fd["arch"] = frame.architecture().name()
-                            except Exception:
-                                pass
-                            frames.append(fd)
-                        level += 1
-                        if high is not None and level > high:
-                            break
-                        try:
-                            frame = frame.older()
-                        except Exception:
-                            break
-                    if frames:
-                        unwound = True
-                finally:
-                    # Always restore original registers regardless of what threw.
-                    # Guard each individually so a failing restore doesn't skip
-                    # the others.
-                    if orig_sp is not None:
-                        try:
-                            gdb.execute(f'set $sp = 0x{orig_sp:x}', to_string=True)
-                        except Exception:
-                            pass
-                    if orig_pc is not None:
-                        try:
-                            gdb.execute(f'set $pc = 0x{orig_pc:x}', to_string=True)
-                        except Exception:
-                            pass
-                    if orig_lr is not None:
-                        try:
-                            gdb.execute(f'set $lr = 0x{orig_lr:x}', to_string=True)
-                        except Exception:
-                            pass
-                    gdb.invalidate_cached_frames()
-
-        # Fallback: single synthetic frame from callee-saved context
-        if not unwound:
-            if low is None or low == 0:
-                frames.append(_build_frame_dict(thread, include_args=False))
+        # Suspended thread — return a synthetic frame from callee-saved context.
+        #
+        # We deliberately avoid the previous approach of temporarily writing
+        # hardware registers ($sp/$pc/$lr via gdb.execute) and walking GDB's
+        # frame chain.  That approach blocks indefinitely when the target was
+        # halted by exec-interrupt (SIGINT) because BMP does not service
+        # register-write remote-protocol commands in that halted state.  The
+        # gdb.execute() call never returns, the MI command never sends a
+        # response, and the TypeScript command queue is stuck forever.
+        #
+        # On ARM Cortex-M, psp+20 in the exception frame holds the EXC_RETURN
+        # magic value (e.g. 0xFFFFFFFD), not a usable function LR, so the DWARF
+        # unwinder can only produce the single top frame anyway.
+        #
+        # _build_frame_dict uses data that was already fetched during
+        # thread discovery (callee_saved.psp and mem[psp+24] are in GDB's
+        # memory cache), so no new target communication is required.
+        if low is None or low == 0:
+            frames.append(_build_frame_dict(thread, include_args=False))
 
     return frames
 
