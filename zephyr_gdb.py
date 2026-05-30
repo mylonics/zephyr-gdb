@@ -62,6 +62,18 @@ _discovery_mode = os.environ.get('ZEPHYR_GDB_DISCOVERY_MODE', 'auto').lower()
 # Thread source: 'native' (probe RTOS list, e.g. BMP), 'kernel' (walk _kernel.threads), 'auto'
 _thread_source = os.environ.get('ZEPHYR_GDB_THREAD_SOURCE', 'auto').lower()
 
+# Records which discovery path actually populated the cache ('native' or
+# 'kernel').  Printed once when it changes so users can tell whether multi-frame
+# backtraces for suspended threads are available (native only).
+_active_discovery_path = None
+
+# True when the most recent stop was caused by exec-interrupt (SIGINT / the VS
+# Code pause button).  Black Magic Probe does not service register *writes*
+# while halted in that state, so the register-swap unwind for suspended threads
+# must be skipped (we fall back to a memory-only unwind).  After a breakpoint,
+# step or reset halt this is False and the accurate register-swap unwind is used.
+_halt_by_sigint = False
+
 # Zephyr thread state bit-flags (from include/zephyr/kernel.h)
 _ZEPHYR_THREAD_STATE_BITS = [
     (1 << 0, 'dummy'),
@@ -663,6 +675,7 @@ def discover_threads(verbose=True):
 
     if _thread_source in ('native', 'auto'):
         if _discover_threads_native(verbose=False):
+            _note_discovery_path('native')
             return
         if _thread_source == 'native':
             if verbose:
@@ -672,11 +685,39 @@ def discover_threads(verbose=True):
         # auto: fall through to kernel walk
 
     _discover_threads_kernel(verbose)
+    if thread_cache:
+        _note_discovery_path('kernel')
+
+
+def _note_discovery_path(path):
+    """Log the active discovery path once whenever it changes.
+
+    'native' means each Zephyr thread maps to a real GDB thread and suspended
+    threads get full multi-frame backtraces.  'kernel' means threads come from
+    walking _kernel.threads; suspended threads show a single frame because the
+    register-write unwind would hang BMP after a SIGINT halt.
+    """
+    global _active_discovery_path
+    if path != _active_discovery_path:
+        _active_discovery_path = path
+        if path == 'native':
+            print("Zephyr GDB: thread discovery = native "
+                  "(multi-frame suspended-thread backtraces enabled).")
+        else:
+            print("Zephyr GDB: thread discovery = kernel-walk "
+                  "(suspended threads show a single frame on BMP).")
 
 
 def stop_handler(event=None):
     """Called when the inferior stops — restore real CPU regs and refresh threads."""
-    global _real_cpu_regs
+    global _real_cpu_regs, _halt_by_sigint
+    # Record whether this stop was an exec-interrupt (SIGINT / pause button).
+    # Suspended-thread register-swap unwinding is unsafe on BMP in that state.
+    try:
+        _halt_by_sigint = (isinstance(event, gdb.SignalEvent)
+                           and getattr(event, 'stop_signal', '') == 'SIGINT')
+    except Exception:
+        _halt_by_sigint = False
     # Restore real CPU registers if we previously swapped to a suspended thread
     if _real_cpu_regs is not None:
         try:
@@ -1023,87 +1064,289 @@ def _is_valid_code_addr(pc):
     return True
 
 
-def _build_frame_list(thread, low=None, high=None):
-    """Return a list of MI-compatible frame dicts for *thread*.
+def _walk_gdb_frames(thread, low=None, high=None):
+    """Walk the *currently selected* GDB thread's frame chain into MI dicts.
 
-    For the active (currently executing) thread the real GDB frame chain
-    is walked.  For suspended threads a single synthetic frame is returned
-    from callee-saved data that was already fetched during thread
-    discovery — no new target communication is required.
+    All work here is register/memory *reads* via GDB's frame API.  The caller
+    is responsible for having selected the desired thread first.
 
     *low* / *high* optionally limit the returned frame range (inclusive,
     0-based).
     """
     frames = []
-
-    if thread.active:
-        # Walk the real GDB frame chain
-        try:
-            frame = gdb.newest_frame()
-            level = 0
-            while frame is not None:
-                if not frame.is_valid():
-                    break
+    try:
+        frame = gdb.newest_frame()
+        level = 0
+        while frame is not None:
+            if not frame.is_valid():
+                break
+            try:
+                pc = frame.pc()
+            except Exception:
+                break
+            if not _is_valid_code_addr(pc):
+                break
+            if (low is None or level >= low) and (high is None or level <= high):
+                fd = {"level": str(level), "addr": f"0x{pc:x}", "func": "??"}
                 try:
-                    pc = frame.pc()
+                    fd["func"] = frame.name() or "??"
                 except Exception:
-                    break
-                if not _is_valid_code_addr(pc):
-                    break
-                if (low is None or level >= low) and (high is None or level <= high):
-                    fd = {"level": str(level), "addr": f"0x{pc:x}", "func": "??"}
-                    try:
-                        fd["func"] = frame.name() or "??"
-                    except Exception:
-                        pass
-                    try:
-                        sal = frame.find_sal()
-                        if sal.symtab:
-                            fd["file"] = sal.symtab.filename
-                            fd["fullname"] = sal.symtab.fullname()
-                            fd["line"] = str(sal.line)
-                    except Exception:
-                        pass
-                    try:
-                        fd["arch"] = frame.architecture().name()
-                    except Exception:
-                        pass
-                    frames.append(fd)
-                level += 1
-                # Stop walking once we have passed the requested upper bound.
-                # Without this the loop continues indefinitely calling
-                # frame.older() far beyond the requested depth, which can
-                # read corrupt stack data and hang GDB on memory accesses.
-                if high is not None and level > high:
-                    break
+                    pass
                 try:
-                    frame = frame.older()
+                    sal = frame.find_sal()
+                    if sal.symtab:
+                        fd["file"] = sal.symtab.filename
+                        fd["fullname"] = sal.symtab.fullname()
+                        fd["line"] = str(sal.line)
                 except Exception:
-                    break
-        except Exception:
+                    pass
+                try:
+                    fd["arch"] = frame.architecture().name()
+                except Exception:
+                    pass
+                frames.append(fd)
+            level += 1
+            # Stop walking once we have passed the requested upper bound.
+            # Without this the loop continues indefinitely calling
+            # frame.older() far beyond the requested depth, which can
+            # read corrupt stack data and hang GDB on memory accesses.
+            if high is not None and level > high:
+                break
+            try:
+                frame = frame.older()
+            except Exception:
+                break
+    except Exception:
+        if not frames:
             frames.append(_build_frame_dict(thread, include_args=False))
-    else:
-        # Suspended thread — return a synthetic frame from callee-saved context.
-        #
-        # We deliberately avoid the previous approach of temporarily writing
-        # hardware registers ($sp/$pc/$lr via gdb.execute) and walking GDB's
-        # frame chain.  That approach blocks indefinitely when the target was
-        # halted by exec-interrupt (SIGINT) because BMP does not service
-        # register-write remote-protocol commands in that halted state.  The
-        # gdb.execute() call never returns, the MI command never sends a
-        # response, and the TypeScript command queue is stuck forever.
-        #
-        # On ARM Cortex-M, psp+20 in the exception frame holds the EXC_RETURN
-        # magic value (e.g. 0xFFFFFFFD), not a usable function LR, so the DWARF
-        # unwinder can only produce the single top frame anyway.
-        #
-        # _build_frame_dict uses data that was already fetched during
-        # thread discovery (callee_saved.psp and mem[psp+24] are in GDB's
-        # memory cache), so no new target communication is required.
-        if low is None or low == 0:
-            frames.append(_build_frame_dict(thread, include_args=False))
-
     return frames
+
+
+def _unwind_suspended_regswap(thread, low=None, high=None):
+    """Unwind a suspended thread by briefly pointing $sp/$pc/$lr at its saved
+    context, walking GDB's real DWARF frame chain, then restoring the registers.
+
+    This yields a full, accurate multi-frame backtrace (the same chain the
+    active thread produces).  It uses register *writes*, so the caller must only
+    invoke it when the target was NOT halted by exec-interrupt (SIGINT) — BMP
+    does not service register writes in that state and would hang.
+
+    Returns a list of frame dicts, or None if the saved context is unavailable
+    (caller should fall back to the memory-only unwind).
+    """
+    cs = getattr(thread, 'callee_saved', None)
+    if cs is None or thread.arch is None:
+        return None
+    saved_pc = thread.arch.get_thread_pc(cs)
+    saved_sp = thread.arch.get_thread_sp(cs)
+    saved_lr = thread.arch.get_thread_lr(cs)
+    if not saved_pc or not saved_sp:
+        return None
+
+    orig = None
+    frames = None
+    try:
+        orig = {
+            "sp": int(gdb.parse_and_eval('$sp')),
+            "pc": int(gdb.parse_and_eval('$pc')),
+            "lr": int(gdb.parse_and_eval('$lr')),
+        }
+        gdb.execute(f'set $sp = 0x{saved_sp:x}', to_string=True)
+        gdb.execute(f'set $pc = 0x{saved_pc:x}', to_string=True)
+        if saved_lr:
+            gdb.execute(f'set $lr = 0x{saved_lr:x}', to_string=True)
+        gdb.invalidate_cached_frames()
+        frames = _walk_gdb_frames(thread, low, high)
+    except Exception:
+        frames = None
+    finally:
+        if orig is not None:
+            try:
+                gdb.execute(f'set $sp = 0x{orig["sp"]:x}', to_string=True)
+                gdb.execute(f'set $pc = 0x{orig["pc"]:x}', to_string=True)
+                gdb.execute(f'set $lr = 0x{orig["lr"]:x}', to_string=True)
+                gdb.invalidate_cached_frames()
+            except Exception:
+                pass
+    return frames
+
+
+def _frame_from_pc(pc, level):
+    """Build an MI frame dict for an arbitrary code address and level."""
+    fd = {"level": str(level), "addr": f"0x{pc:x}", "func": "??"}
+    try:
+        block = gdb.block_for_pc(pc)
+        while block and block.function is None:
+            block = block.superblock
+        if block and block.function:
+            fd["func"] = str(block.function)
+    except Exception:
+        pass
+    f, fn, ln = _resolve_sal(pc)
+    if f:
+        fd["file"] = f
+        fd["fullname"] = fn
+        fd["line"] = ln
+    return fd
+
+
+def _thread_stack_high(thread):
+    """Return the high (end) address of a thread's stack, or None.
+
+    Uses k_thread.stack_info (present when CONFIG_THREAD_STACK_INFO=y) to bound
+    the heuristic stack scan; falls back to None when unavailable.
+    """
+    try:
+        t = thread.thread_ptr.dereference()
+        si = t['stack_info']
+        return int(si['start']) + int(si['size'])
+    except Exception:
+        return None
+
+
+def _is_call_return(ra):
+    """Heuristic: True if the instruction immediately preceding *ra* is a Thumb
+    call (BL / BLX), i.e. *ra* is a plausible return address.  Reads code memory
+    only (flash reads are safe on BMP even after a SIGINT halt)."""
+    try:
+        buf = gdb.selected_inferior().read_memory(ra - 4, 4)
+        h_lo, h_hi = struct.unpack('<HH', buf)
+    except Exception:
+        return False
+    # 32-bit BL/BLX (imm): 11110xxxxxxxxxxx  11xxxxxxxxxxxxxx
+    if (h_lo & 0xF800) == 0xF000 and (h_hi & 0xC000) == 0xC000:
+        return True
+    # 16-bit BLX (register): 010001111xxxx000  (instruction sits at ra-2)
+    if (h_hi & 0xFF80) == 0x4780:
+        return True
+    return False
+
+
+def _unwind_suspended_memonly(thread, low=None, high=None):
+    """Unwind a suspended thread using only target memory *reads* (BMP-safe even
+    after a SIGINT halt).
+
+    On ARM Cortex-M the saved context is a hardware exception frame, so the top
+    two frames are exact: the stacked PC (the swap point, level 0) and the
+    stacked LR (its caller, level 1).  Deeper frames cannot be recovered exactly
+    without DWARF CFI (which needs the register-swap path), so we heuristically
+    scan the thread's stack for plausible return addresses — words that have the
+    Thumb bit set, point inside a known function, and are immediately preceded by
+    a BL/BLX call instruction.  These extra frames are best-effort and may
+    occasionally include a stale address, but they recover most of the call
+    chain that pause-mode would otherwise hide.
+    """
+    arch = thread.arch
+    cs = getattr(thread, 'callee_saved', None)
+
+    frames = []
+    # Level 0: exact — the stacked PC (swap point).
+    frames.append(_build_frame_dict(thread, include_args=False))
+
+    if cs is not None and arch is not None:
+        # Level 1: exact — the stacked LR (caller of the swap point).
+        try:
+            lr = arch.get_thread_lr(cs) & ~1
+        except Exception:
+            lr = 0
+        if _is_valid_code_addr(lr):
+            frames.append(_frame_from_pc(lr, len(frames)))
+
+        # Levels 2+: heuristic stack scan from the interrupted SP upward.
+        try:
+            sp = arch.get_thread_sp(cs)
+        except Exception:
+            sp = 0
+        if sp:
+            top = _thread_stack_high(thread)
+            # Bound the scan: to the stack top if known, else a fixed window.
+            max_bytes = (top - sp) if (top and top > sp) else 2048
+            max_bytes = max(0, min(max_bytes, 4096))
+            seen = {lr} if _is_valid_code_addr(lr) else set()
+            try:
+                words = gdb.selected_inferior().read_memory(sp, max_bytes & ~3)
+                count = (max_bytes & ~3) // 4
+                vals = struct.unpack(f'<{count}I', words)
+            except Exception:
+                vals = ()
+            for w in vals:
+                if len(frames) >= 32:
+                    break
+                if not (w & 1):
+                    continue  # stacked return addresses keep the Thumb bit set
+                ra = w & ~1
+                if ra in seen or not _is_valid_code_addr(ra):
+                    continue
+                # Must land inside a real function and follow a call instruction.
+                try:
+                    blk = gdb.block_for_pc(ra)
+                except Exception:
+                    blk = None
+                while blk and blk.function is None:
+                    blk = blk.superblock
+                if not (blk and blk.function):
+                    continue
+                if not _is_call_return(ra):
+                    continue
+                seen.add(ra)
+                frames.append(_frame_from_pc(ra, len(frames)))
+
+    # Apply the requested level window.
+    if low is not None or high is not None:
+        frames = [f for f in frames
+                  if (low is None or int(f["level"]) >= low)
+                  and (high is None or int(f["level"]) <= high)]
+    return frames
+
+
+
+def _build_frame_list(thread, low=None, high=None):
+    """Return a list of MI-compatible frame dicts for *thread*.
+
+    * Active thread — walk GDB's real selected frame chain (reads only).
+    * Suspended thread with a native GDB thread (non-BMP RTOS-aware probes) —
+      select it and walk its chain (reads only).
+    * Suspended thread from the kernel walk (the BMP case) — after a breakpoint/
+      step/reset halt use the register-swap unwind for a full backtrace; after a
+      SIGINT (pause) halt fall back to a memory-only two-frame unwind, because
+      BMP hangs on register writes in that state.
+
+    *low* / *high* optionally limit the returned frame range (inclusive,
+    0-based).
+    """
+    if thread.active:
+        return _walk_gdb_frames(thread, low, high)
+
+    native = getattr(thread, 'native_thread', None)
+    if native is not None:
+        saved = None
+        try:
+            saved = gdb.selected_thread()
+        except Exception:
+            saved = None
+        try:
+            if native.is_valid():
+                if native is not saved:
+                    native.switch()
+                return _walk_gdb_frames(thread, low, high)
+        except Exception:
+            pass
+        finally:
+            try:
+                if saved is not None and saved.is_valid() and saved is not native:
+                    saved.switch()
+            except Exception:
+                pass
+
+    # Kernel-walk suspended thread (BMP).  Prefer the accurate register-swap
+    # unwind when register writes are safe (non-SIGINT halt).
+    if not _halt_by_sigint:
+        frames = _unwind_suspended_regswap(thread, low, high)
+        if frames:
+            return frames
+
+    # SIGINT halt, or the register-swap unwind was unavailable: memory-only.
+    return _unwind_suspended_memonly(thread, low, high)
 
 
 # Guard: gdb.MICommand is only available in GDB 12+
